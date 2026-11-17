@@ -7,6 +7,7 @@
 //! duplicate source before Cargo computes them.
 
 mod check_targets;
+mod lease_scope;
 
 use anyhow::{Context, Result, bail};
 use std::ffi::{OsStr, OsString};
@@ -105,8 +106,14 @@ pub(crate) fn run_shim(shim: &OsStr, cargo_args: Vec<OsString>) -> Result<()> {
     let config =
         crate::config::Config::load_for(&env).context("loading the cache configuration")?;
     let what = cargo_command_label(cargo_args.iter().map(OsString::as_os_str));
+    // Blaze builds through an engine of its own, wherever that keeps output.
+    let scope = match env.cwd().filter(|_| !config.blaze) {
+        Some(cwd) => lease_scope::of(cwd, &cargo_args, &env),
+        None => crate::target_use::Scope::Everything,
+    };
     let lease = crate::target_use::shared_for(
         &config.cache_dir,
+        &scope,
         &what,
         cargo_args.iter().map(OsString::as_os_str),
     )
@@ -265,14 +272,20 @@ fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
             .any(|value| value == WORKTREE_BUILD_DIR_CONFIG),
     );
 
-    run_cargo_with_target_protection(command, &cargo)
+    let scope = lease_scope::of(&cwd, &cargo_args, &env);
+    run_cargo_with_target_protection(command, &cargo, &scope)
 }
 
-fn run_cargo_with_target_protection(command: Command, cargo: &Path) -> Result<()> {
+fn run_cargo_with_target_protection(
+    command: Command,
+    cargo: &Path,
+    scope: &crate::target_use::Scope,
+) -> Result<()> {
     let config = crate::config::Config::load().context("loading the cache configuration")?;
     let what = cargo_command_label(command.get_args());
-    let target_use = crate::target_use::shared_for(&config.cache_dir, &what, command.get_args())
-        .context("protecting target directories while Cargo runs")?;
+    let target_use =
+        crate::target_use::shared_for(&config.cache_dir, scope, &what, command.get_args())
+            .context("protecting target directories while Cargo runs")?;
     run_cargo_and_exit(command, cargo, target_use, &config)
 }
 

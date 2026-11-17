@@ -333,7 +333,7 @@ fn watch_with(
     shows_reads: impl FnOnce(&Path) -> std::io::Result<bool>,
     write: impl FnOnce(&Path, SystemTime) -> anyhow::Result<()>,
 ) {
-    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir) else {
+    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir, target_dir) else {
         return;
     };
     let record = armed_record(cache_dir, target_dir);
@@ -451,7 +451,7 @@ fn prune_with(
     if crate::target_processes::ActivePrograms::default().uses(target_dir) {
         return Pruned::default();
     }
-    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir) else {
+    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir, target_dir) else {
         return Pruned::default();
     };
     if !can_arm(
