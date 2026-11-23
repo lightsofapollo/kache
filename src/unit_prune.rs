@@ -789,7 +789,7 @@ pub(crate) fn prune_superseded(cache_dir: &Path, target_dir: &Path, keep: usize)
     if !may_remove_superseded(target_dir, keep) {
         return pruned;
     }
-    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir) else {
+    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir, target_dir) else {
         return pruned;
     };
     for profile in profiles(target_dir) {

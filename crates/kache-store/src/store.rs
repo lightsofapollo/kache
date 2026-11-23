@@ -5957,7 +5957,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             );
             return Ok(GcStats {
                 bytes_held,
-                entries_unreclaimable: held.len(),
+                entries_unreclaimable: held.refused.len(),
                 ..GcStats::default()
             });
         }
