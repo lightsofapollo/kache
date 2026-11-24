@@ -142,29 +142,31 @@ pub(crate) struct Standing {
     pub(crate) held: bool,
 }
 
+///
+/// A scope whose client names no process (Windows, which reads its peer
+/// through a pinned handle) keeps the priority it arrived with and is never
+/// held.
 pub(crate) fn standing() -> Standing {
-    let client = INVOCATION.with(std::cell::Cell::get);
-    #[cfg(unix)]
-    {
-        let pid = client
-            .and_then(|client| client.pid)
-            .unwrap_or_else(std::process::id);
-        let priority = match client {
-            Some(Client { pid: Some(pid), .. }) => Priority::of_process(pid),
-            Some(client) => client.priority,
-            None => Priority::of_this_process(),
-        };
-        Standing {
-            priority,
+    match INVOCATION.with(std::cell::Cell::get) {
+        #[cfg(unix)]
+        Some(Client { pid: Some(pid), .. }) => Standing {
+            priority: Priority::of_process(pid),
             held: lineage_stopped(pid),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        Standing {
-            priority: client.map_or_else(Priority::of_this_process, |client| client.priority),
+        },
+        Some(client) => Standing {
+            priority: client.priority,
             held: false,
-        }
+        },
+        #[cfg(unix)]
+        None => Standing {
+            priority: Priority::of_this_process(),
+            held: lineage_stopped(std::process::id()),
+        },
+        #[cfg(not(unix))]
+        None => Standing {
+            priority: Priority::of_this_process(),
+            held: false,
+        },
     }
 }
 
@@ -537,12 +539,24 @@ mod tests {
             .unwrap();
         let child: u32 = line.trim().parse().unwrap();
         let parent_pid = parent.id() as libc::pid_t;
+        // The walk ends below this test process: a scheduler may stop the
+        // Cargo that runs the suite.
+        let this = std::process::id();
+        let walk = || {
+            lineage_stopped_by(child, |pid| {
+                if pid == this {
+                    None
+                } else {
+                    process_status(pid)
+                }
+            })
+        };
         let settled = |want: bool| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while lineage_stopped(child) != want && std::time::Instant::now() < deadline {
+            while walk() != want && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            lineage_stopped(child)
+            walk()
         };
         let running = settled(false);
         unsafe { libc::kill(parent_pid, libc::SIGSTOP) };
@@ -562,18 +576,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_client_scope_reads_its_process_again() {
-        let own = standing();
-        assert!(!own.held);
         {
             let _scope = InvocationPriorityScope::enter(Some(Priority::Background));
-            assert_eq!(standing().priority, Priority::Background);
-            assert!(!standing().held, "no client: this process");
+            assert_eq!(
+                standing(),
+                Standing {
+                    priority: Priority::Background,
+                    held: false
+                },
+                "a client with no process"
+            );
         }
-        let mut sleeper = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let pid = sleeper.id();
+        let (pid, _sleeper) = detached_sleeper();
         let client = Client::of_process(pid);
         assert_eq!(client.pid, Some(pid));
         let _scope = InvocationPriorityScope::enter_client(Some(Client {
@@ -592,9 +606,36 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let held = standing().held;
-        let _ = sleeper.kill();
-        let _ = sleeper.wait();
         assert!(held, "the client was stopped");
+    }
+
+    #[cfg(unix)]
+    /// A `sleep` whose parent has exited, so its lineage is itself alone,
+    /// whatever holds the process running the tests. Killed on drop.
+    pub(crate) fn detached_sleeper() -> (u32, Killed) {
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 60 >/dev/null 2>&1 & echo $!"])
+            .output()
+            .unwrap();
+        let pid: u32 = String::from_utf8(out.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        (pid, Killed(pid))
+    }
+
+    #[cfg(unix)]
+    pub(crate) struct Killed(u32);
+
+    #[cfg(unix)]
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(self.0 as libc::pid_t, libc::SIGCONT);
+                libc::kill(self.0 as libc::pid_t, libc::SIGKILL);
+            }
+        }
     }
 
     #[cfg(unix)]

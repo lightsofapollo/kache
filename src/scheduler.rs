@@ -5173,11 +5173,17 @@ mod tests {
         let dir = temp_cache();
         let cache = dir.path();
         // The client of the earlier request; stopping it holds that build.
-        let mut client = std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
+        // Its parent has exited, so nothing holding the process that runs
+        // the tests holds it.
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 60 >/dev/null 2>&1 & echo $!"])
+            .output()
             .unwrap();
-        let client_pid = client.id();
+        let client_pid: u32 = String::from_utf8(out.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         let signal = |signal| unsafe { libc::kill(client_pid as libc::pid_t, signal) };
         let rank_of = |id: &str| {
             queued(cache)
@@ -5216,8 +5222,7 @@ mod tests {
         later.finish();
         earlier.admitted(Duration::from_secs(5));
         earlier.finish();
-        let _ = client.kill();
-        let _ = client.wait();
+        signal(libc::SIGKILL);
     }
 
     #[test]
@@ -5257,11 +5262,14 @@ mod tests {
     #[ignore = "subprocess fixture for a_killed_waiter_loses_its_place"]
     fn queued_waiter_child_fixture() {
         let cache = PathBuf::from(std::env::var_os("KACHE_TEST_SCHEDULER_ROOT").unwrap());
+        // Ranked as it arrived, whatever holds the process running the tests.
+        let _priority = InvocationPriorityScope::enter(Some(Priority::Background));
         let _ = test_scheduler(&cache, 1).acquire_permit(1);
     }
 
     #[test]
     fn a_killed_waiter_loses_its_place() {
+        let _priority = InvocationPriorityScope::enter(Some(Priority::Background));
         let dir = temp_cache();
         let cache = dir.path();
         let scheduler = test_scheduler(cache, 1);
