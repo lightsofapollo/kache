@@ -1780,7 +1780,7 @@ fn run_compiler_invocation_inner(
     let _pressure =
         scheduler::pressure::InvocationPressureScope::enter(config.scheduler_memory_pressure);
     let _scheduler_wait = config.scheduler.then(scheduler::InvocationWaitScope::enter);
-    let _priority = scheduler::InvocationPriorityScope::enter(priority);
+    let _priority = scheduler::InvocationPriorityScope::enter_client(priority);
 
     if config.disabled {
         // Caching off — pass straight through to the real compiler. The

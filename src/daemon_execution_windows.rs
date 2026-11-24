@@ -253,7 +253,10 @@ pub(super) async fn handle(
             .into_owned(),
         io: InvocationIo::from_broker(broker),
         cancellation: Some(cancellation.clone()),
-        priority: Some(priority),
+        priority: Some(crate::scheduler::Client {
+            priority,
+            pid: None,
+        }),
     };
     let activity = daemon.request_clock.begin_activity();
     let mut worker = tokio::task::spawn_blocking(move || {

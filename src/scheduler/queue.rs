@@ -13,10 +13,16 @@
 //! plan with the same free slots.
 //!
 //! - Rank: the arrival time in milliseconds, less [`FOREGROUND_HEAD_START`]
-//!   for a foreground build. Lower ranks go first. A ticket keeps its rank
-//!   while later ones arrive, so its priority rises the longer it waits: a
-//!   background request that has waited the head start outranks every
-//!   foreground request that arrives after.
+//!   for a foreground build. Lower ranks go first. A ticket keeps its
+//!   arrival while later ones arrive, so its priority rises the longer it
+//!   waits: a background request that has waited the head start outranks
+//!   every foreground request that arrives after.
+//! - The owner ranks its ticket again each time it looks, from how its build
+//!   stands then (see [`super::priority::standing`]): a build lowered to
+//!   background after it asked loses its head start, and a held build (one
+//!   a process above it has stopped) ranks [`HELD_BEHIND`] later, behind
+//!   every build that runs. A planner reads ranks from ticket names, so a
+//!   Kache release from before re-ranking orders by them too.
 //! - Free slots go to tickets in rank order, each taking the lowest slots it
 //!   can use. A ticket that does not fit is passed by later ones that do.
 //! - The first ticket can be passed [`pass_budget`] times. After that it
@@ -42,13 +48,17 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::priority::Priority;
+use super::priority::{Priority, Standing};
 
 /// How far ahead of a background request a foreground one arriving at the
 /// same time is placed. Well inside the 30 s an ordinary capacity wait may
 /// last (see [`super::budget`]), so a background request still in the queue
 /// comes to outrank foreground requests that arrive after it.
 pub(super) const FOREGROUND_HEAD_START: Duration = Duration::from_secs(10);
+/// How far a held build's ticket ranks behind its arrival: further than any
+/// arrival time, so every running build's ticket goes first and held ones
+/// keep their arrival order among themselves.
+pub(super) const HELD_BEHIND: u64 = 1 << 60;
 /// How long a ticket counts after its owner last looked. A waiter looks at
 /// least every [`super::permit_wait::SATURATED_SLICE`].
 pub(super) const STALE_AFTER: Duration = Duration::from_secs(2);
@@ -215,6 +225,16 @@ pub(super) fn rank(now: SystemTime, priority: Priority) -> u64 {
     match priority {
         Priority::Foreground => arrived.saturating_sub(FOREGROUND_HEAD_START.as_millis() as u64),
         Priority::Background => arrived,
+    }
+}
+
+/// The rank of a request that arrived at `arrived`, as its build stands now.
+pub(super) fn rank_standing(arrived: SystemTime, standing: Standing) -> u64 {
+    let rank = rank(arrived, standing.priority);
+    if standing.held {
+        rank.saturating_add(HELD_BEHIND)
+    } else {
+        rank
     }
 }
 
@@ -521,12 +541,13 @@ impl Ticket {
         &self.entry
     }
 
-    /// Note that the owner looked at `now`, asking for `need` slots. Call only
-    /// under `queue.lock`.
-    pub(super) fn refresh(&mut self, need: u32, now: SystemTime) -> Result<()> {
-        if need != self.entry.need {
+    /// Note that the owner looked at `now`, asking for `need` slots at
+    /// `rank`. Call only under `queue.lock`.
+    pub(super) fn refresh(&mut self, need: u32, rank: u64, now: SystemTime) -> Result<()> {
+        if need != self.entry.need || rank != self.entry.rank {
             let renamed = Entry {
                 need,
+                rank,
                 ..self.entry.clone()
             };
             fs::rename(
@@ -656,6 +677,45 @@ mod tests {
         // head start goes before a foreground one that arrives after.
         assert!(rank(at(100_000), Priority::Background) < rank(at(110_001), Priority::Foreground));
         assert!(rank(at(100_000), Priority::Background) > rank(at(109_999), Priority::Foreground));
+    }
+
+    #[test]
+    fn a_ticket_ranks_from_how_its_build_stands() {
+        let standing = |priority, held| Standing { priority, held };
+        let arrived = at(100_000);
+        assert_eq!(
+            rank_standing(arrived, standing(Priority::Background, false)),
+            100_000
+        );
+        assert_eq!(
+            rank_standing(arrived, standing(Priority::Foreground, false)),
+            90_000
+        );
+        assert_eq!(
+            rank_standing(arrived, standing(Priority::Background, true)),
+            100_000 + (1 << 60)
+        );
+        assert_eq!(
+            rank_standing(arrived, standing(Priority::Foreground, true)),
+            90_000 + (1 << 60)
+        );
+        // Held tickets go behind any running one, however late it came,
+        // and keep their arrival order among themselves.
+        let running_late =
+            rank_standing(at(4_000_000_000_000), standing(Priority::Background, false));
+        assert!(rank_standing(arrived, standing(Priority::Foreground, true)) > running_late);
+        assert!(
+            rank_standing(at(1), standing(Priority::Background, true))
+                < rank_standing(at(2), standing(Priority::Background, true))
+        );
+        assert_eq!(
+            rank_standing(
+                UNIX_EPOCH + Duration::from_millis(u64::MAX),
+                standing(Priority::Background, true)
+            ),
+            u64::MAX,
+            "saturates"
+        );
     }
 
     #[test]
@@ -1044,7 +1104,7 @@ mod tests {
         record_pass(dir.path(), &queued).unwrap();
         assert_eq!(passes(dir.path(), &queued), 2);
 
-        ticket.refresh(4, at(3_000)).unwrap();
+        ticket.refresh(4, 7, at(3_000)).unwrap();
         assert_eq!(
             list(dir.path()).unwrap(),
             std::slice::from_ref(&queued),
@@ -1052,13 +1112,19 @@ mod tests {
         );
         assert!(ready(dir.path(), &queued, at(4_000)), "seen again at 3 s");
 
-        ticket.refresh(2, at(5_000)).unwrap();
+        ticket.refresh(2, 7, at(5_000)).unwrap();
         let shrunk = entry(7, Kind::Compile, 2, "grow");
         assert_eq!(ticket.entry(), &shrunk);
         assert_eq!(list(dir.path()).unwrap(), std::slice::from_ref(&shrunk));
         assert_eq!(passes(dir.path(), &shrunk), 2);
         assert_eq!(passes(dir.path(), &queued), 0, "the old name is gone");
         assert!(record_pass(dir.path(), &queued).is_err());
+
+        ticket.refresh(2, 9 + HELD_BEHIND, at(6_000)).unwrap();
+        let held = entry(9 + (1 << 60), Kind::Compile, 2, "grow");
+        assert_eq!(ticket.entry(), &held);
+        assert_eq!(list(dir.path()).unwrap(), std::slice::from_ref(&held));
+        assert_eq!(passes(dir.path(), &held), 2, "a new rank keeps the passes");
         drop(ticket);
         assert!(list(dir.path()).unwrap().is_empty());
     }

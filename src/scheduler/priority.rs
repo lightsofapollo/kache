@@ -61,22 +61,54 @@ impl Priority {
     }
 }
 
+/// The process that sent a request the daemon executes, and its priority
+/// when the request arrived. The caller must know `pid` names that process
+/// for as long as the request runs, such as the authenticated peer of the
+/// open connection the request came on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Client {
+    pub(crate) priority: Priority,
+    // Windows reads the peer through its pinned handle instead.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) pid: Option<u32>,
+}
+
+impl Client {
+    #[cfg(unix)]
+    pub(crate) fn of_process(pid: u32) -> Self {
+        Self {
+            priority: Priority::of_process(pid),
+            pid: Some(pid),
+        }
+    }
+}
+
 thread_local! {
-    static INVOCATION: std::cell::Cell<Option<Priority>> = const { std::cell::Cell::new(None) };
+    static INVOCATION: std::cell::Cell<Option<Client>> = const { std::cell::Cell::new(None) };
 }
 
 /// The priority of one synchronous request whose build is another process.
-/// The daemon enters it with its client's priority; a request outside any
-/// scope reads its own process.
+/// The daemon enters it with its client; a request outside any scope reads
+/// its own process.
 pub(crate) struct InvocationPriorityScope {
-    previous: Option<Priority>,
+    previous: Option<Client>,
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl InvocationPriorityScope {
+    /// A scope with `priority` and no client process: whether the build is
+    /// held is read from this process.
+    #[cfg(test)]
     pub(crate) fn enter(priority: Option<Priority>) -> Self {
+        Self::enter_client(priority.map(|priority| Client {
+            priority,
+            pid: None,
+        }))
+    }
+
+    pub(crate) fn enter_client(client: Option<Client>) -> Self {
         Self {
-            previous: INVOCATION.with(|slot| slot.replace(priority)),
+            previous: INVOCATION.with(|slot| slot.replace(client)),
             _thread: std::marker::PhantomData,
         }
     }
@@ -88,11 +120,128 @@ impl Drop for InvocationPriorityScope {
     }
 }
 
-/// The priority of the build this thread is serving.
+/// The priority of the build this thread is serving, as it was when the
+/// request arrived.
 pub(crate) fn current() -> Priority {
     INVOCATION
         .with(std::cell::Cell::get)
-        .unwrap_or_else(Priority::of_this_process)
+        .map_or_else(Priority::of_this_process, |client| client.priority)
+}
+
+/// How the build this thread is serving stands now, read again on every
+/// call: a waiting request is re-ranked from it each time it looks (see
+/// [`super::queue`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Standing {
+    pub(crate) priority: Priority,
+    /// A process the request descends from is stopped (`SIGSTOP`, job
+    /// control, or a scheduler above the build such as one that holds
+    /// lower-ranked builds at their Cargo). Such a build starts no new work
+    /// until it is continued, so its waiting requests yield to builds that
+    /// run.
+    pub(crate) held: bool,
+}
+
+pub(crate) fn standing() -> Standing {
+    let client = INVOCATION.with(std::cell::Cell::get);
+    #[cfg(unix)]
+    {
+        let pid = client
+            .and_then(|client| client.pid)
+            .unwrap_or_else(std::process::id);
+        let priority = match client {
+            Some(Client { pid: Some(pid), .. }) => Priority::of_process(pid),
+            Some(client) => client.priority,
+            None => Priority::of_this_process(),
+        };
+        Standing {
+            priority,
+            held: lineage_stopped(pid),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Standing {
+            priority: client.map_or_else(Priority::of_this_process, |client| client.priority),
+            held: false,
+        }
+    }
+}
+
+#[cfg(any(test, unix))]
+/// The most processes [`lineage_stopped`] reads: a build sits a handful of
+/// levels below its Cargo, and a cycle of reused parent IDs cannot loop.
+const LINEAGE_DEPTH: usize = 32;
+
+/// Whether `pid` or one of its ancestors is stopped. An unreadable process
+/// ends the walk as not stopped.
+#[cfg(unix)]
+pub(crate) fn lineage_stopped(pid: u32) -> bool {
+    lineage_stopped_by(pid, process_status)
+}
+
+/// [`lineage_stopped`] over `status`, which gives a process's stopped state
+/// and parent.
+#[cfg(any(test, unix))]
+pub(crate) fn lineage_stopped_by(
+    pid: u32,
+    mut status: impl FnMut(u32) -> Option<(bool, u32)>,
+) -> bool {
+    let mut pid = pid;
+    for _ in 0..LINEAGE_DEPTH {
+        let Some((stopped, parent)) = status(pid) else {
+            return false;
+        };
+        if stopped {
+            return true;
+        }
+        if parent <= 1 || parent == pid {
+            return false;
+        }
+        pid = parent;
+    }
+    false
+}
+
+/// A `/proc/<pid>/stat` line's stopped state and parent. The command name
+/// can hold spaces and parentheses, so the fields follow the last `)`.
+/// `T` is a stop; `t`, a tracer's stop, is not one a scheduler asked for.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn linux_stat_status(stat: &str) -> Option<(bool, u32)> {
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+    let state = fields.next()?;
+    let parent = fields.next()?.parse().ok()?;
+    Some((state == "T", parent))
+}
+
+#[cfg(target_os = "linux")]
+fn process_status(pid: u32) -> Option<(bool, u32)> {
+    linux_stat_status(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// `SSTOP` in `<sys/proc.h>`.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) const MACOS_STOPPED: u32 = 4;
+
+#[cfg(target_os = "macos")]
+// Linux mutation shards cannot execute this macOS syscall adapter. The walk
+// is exercised on every host; macOS CI also tests real stopped processes.
+#[mutants::skip]
+fn process_status(pid: u32) -> Option<(bool, u32)> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: as in `process_is_background`.
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let written =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    (written == size).then_some((info.pbi_status == MACOS_STOPPED, info.pbi_ppid))
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+#[mutants::skip] // Not compiled by the supported-platform CI matrix.
+fn process_status(pid: u32) -> Option<(bool, u32)> {
+    let _ = pid;
+    None
 }
 
 /// Whether macOS reports a process as background: Darwin background set from
@@ -318,6 +467,134 @@ mod tests {
             std::fs::read_to_string(out).unwrap(),
             "(Background, Background)"
         );
+    }
+
+    #[test]
+    fn a_lineage_is_stopped_when_any_ancestor_is() {
+        // pid -> (stopped, parent)
+        let tree = |stopped: &'static [u32]| {
+            move |pid: u32| match pid {
+                40 => Some((stopped.contains(&40), 30)),
+                30 => Some((stopped.contains(&30), 20)),
+                20 => Some((stopped.contains(&20), 1)),
+                _ => None,
+            }
+        };
+        assert!(!lineage_stopped_by(40, tree(&[])));
+        assert!(lineage_stopped_by(40, tree(&[40])), "the process itself");
+        assert!(lineage_stopped_by(40, tree(&[30])), "its parent");
+        assert!(lineage_stopped_by(40, tree(&[20])), "a grandparent");
+        assert!(
+            !lineage_stopped_by(30, tree(&[40])),
+            "a child is not an ancestor"
+        );
+        assert!(!lineage_stopped_by(99, tree(&[20])), "unreadable");
+        // launchd or init ends the walk without being read.
+        assert!(!lineage_stopped_by(20, |pid| match pid {
+            20 => Some((false, 1)),
+            _ => Some((true, 0)),
+        }));
+        // A process that is its own parent, or a cycle, ends the walk.
+        assert!(!lineage_stopped_by(7, |_| Some((false, 7))));
+        let mut reads = 0;
+        assert!(!lineage_stopped_by(5, |pid| {
+            reads += 1;
+            Some((false, if pid == 5 { 6 } else { 5 }))
+        }));
+        assert_eq!(reads, LINEAGE_DEPTH);
+        let mut reads = 0;
+        assert!(
+            lineage_stopped_by(2, |pid| {
+                reads += 1;
+                Some((reads == LINEAGE_DEPTH, pid + 1))
+            }),
+            "the deepest ancestor read counts"
+        );
+    }
+
+    #[test]
+    fn a_linux_stat_line_gives_the_stop_and_the_parent() {
+        assert_eq!(linux_stat_status("42 (cargo) T 17 42"), Some((true, 17)));
+        assert_eq!(linux_stat_status("42 (a) (b) S 9 1"), Some((false, 9)));
+        assert_eq!(linux_stat_status("42 (gdb'd) t 9 1"), Some((false, 9)));
+        assert_eq!(linux_stat_status("42 (x) R"), None);
+        assert_eq!(linux_stat_status("42 (x) R x"), None);
+        assert_eq!(linux_stat_status("no fields"), None);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_stopped_parent_holds_its_running_child() {
+        use std::io::BufRead;
+        let mut parent = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(parent.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let child: u32 = line.trim().parse().unwrap();
+        let parent_pid = parent.id() as libc::pid_t;
+        let settled = |want: bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while lineage_stopped(child) != want && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            lineage_stopped(child)
+        };
+        let running = settled(false);
+        unsafe { libc::kill(parent_pid, libc::SIGSTOP) };
+        let stopped = settled(true);
+        unsafe { libc::kill(parent_pid, libc::SIGCONT) };
+        let continued = settled(false);
+        unsafe {
+            libc::kill(child as libc::pid_t, libc::SIGKILL);
+            libc::kill(parent_pid, libc::SIGKILL);
+        }
+        let _ = parent.wait();
+        assert!(!running, "a running lineage");
+        assert!(stopped, "the parent was stopped");
+        assert!(!continued, "the parent was continued");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_client_scope_reads_its_process_again() {
+        let own = standing();
+        assert!(!own.held);
+        {
+            let _scope = InvocationPriorityScope::enter(Some(Priority::Background));
+            assert_eq!(standing().priority, Priority::Background);
+            assert!(!standing().held, "no client: this process");
+        }
+        let mut sleeper = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = sleeper.id();
+        let client = Client::of_process(pid);
+        assert_eq!(client.pid, Some(pid));
+        let _scope = InvocationPriorityScope::enter_client(Some(Client {
+            priority: Priority::Background,
+            pid: Some(pid),
+        }));
+        assert_eq!(current(), Priority::Background, "as it arrived");
+        assert_eq!(
+            standing().priority,
+            Priority::of_process(pid),
+            "as it is now"
+        );
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !standing().held && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let held = standing().held;
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        assert!(held, "the client was stopped");
     }
 
     #[cfg(unix)]

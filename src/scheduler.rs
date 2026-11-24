@@ -50,7 +50,7 @@ use anyhow::Result;
 pub(crate) use budget::{BudgetWait, InvocationWaitScope};
 use kache_core::scheduler::SchedulerPressure;
 use kache_protocol::{SchedulerDecision, SchedulerOutcome, SchedulerPhase};
-pub(crate) use priority::{InvocationPriorityScope, Priority};
+pub(crate) use priority::{Client, InvocationPriorityScope, Priority};
 use std::fs;
 use std::io::Write;
 use std::ops::Range;
@@ -1215,6 +1215,7 @@ enum WaitStep {
 struct Request {
     kind: queue::Kind,
     spare: bool,
+    arrived: SystemTime,
     rank: u64,
     /// What the last scan found the queue saving for a waiting test.
     saved_for_tests: std::cell::Cell<u32>,
@@ -1225,10 +1226,12 @@ struct Request {
 impl Request {
     fn new(kind: queue::Kind, spare: bool) -> Self {
         let priority = priority::current();
+        let arrived = SystemTime::now();
         Self {
             kind,
             spare,
-            rank: queue::rank(SystemTime::now(), priority),
+            arrived,
+            rank: queue::rank(arrived, priority),
             saved_for_tests: std::cell::Cell::new(0),
             evidence: std::cell::RefCell::new(SchedulerDecision {
                 phase: SchedulerPhase::Capacity,
@@ -1315,9 +1318,16 @@ impl Scheduler {
             let mut evidence = request.evidence.borrow_mut();
             evidence.requested_slots = Some(evidence.requested_slots.unwrap_or(0).max(need));
         }
+        // A request that has waited is ranked again from how its build
+        // stands, read before the lock: the walk up its process tree is
+        // a few system calls, and every waiter plans under this lock.
+        let rank = match ticket {
+            Some(_) => queue::rank_standing(request.arrived, priority::standing()),
+            None => request.rank,
+        };
         let wait = queue::LOCK_WAIT.min(allowance);
         match queue::lock(&self.root, wait) {
-            Ok(Some(_queue)) => match self.admit_in_order(request, need, ticket) {
+            Ok(Some(_queue)) => match self.admit_in_order(request, need, rank, ticket) {
                 Ok(collect) => return Ok(collect),
                 Err(error) => {
                     tracing::debug!("permit queue unusable ({error:#}); taking slots out of order")
@@ -1338,15 +1348,16 @@ impl Scheduler {
         &self,
         request: &Request,
         need: u32,
+        rank: u64,
         ticket: &mut Option<queue::Ticket>,
     ) -> Result<Collect> {
         let now = SystemTime::now();
         let me = match ticket {
             Some(ticket) => {
-                ticket.refresh(need, now)?;
+                ticket.refresh(need, rank, now)?;
                 ticket.entry().clone()
             }
-            None => queue::Entry::new(request.rank, request.kind, need),
+            None => queue::Entry::new(rank, request.kind, need),
         };
         let queued = queue::list(&self.root)?;
         let collect = if queued.iter().all(|entry| entry.id == me.id) {
@@ -2458,7 +2469,10 @@ mod tests {
         let mut scheduler = test_scheduler(dir.path(), 4);
         let _holder = scheduler.acquire_permit(4).unwrap();
         scheduler.wait_timeout = Duration::ZERO;
+        // A waiter ranks again from its arrival each time it looks.
+        let _priority = InvocationPriorityScope::enter(Some(Priority::Background));
         let request = Request {
+            arrived: std::time::UNIX_EPOCH + Duration::from_millis(17),
             rank: 17,
             kind: queue::Kind::Compile,
             spare: false,
@@ -4983,11 +4997,20 @@ mod tests {
             priority: Priority,
             level: Level,
         ) -> Self {
+            let client = Client {
+                priority,
+                pid: None,
+            };
+            Self::spawn_for(cache, pool, weight, client, level)
+        }
+
+        /// [`Requester::spawn`] for a build whose client is another process.
+        fn spawn_for(cache: &Path, pool: u32, weight: u32, client: Client, level: Level) -> Self {
             let (admit, admitted) = std::sync::mpsc::channel();
             let (release, released) = std::sync::mpsc::channel::<()>();
             let cache = cache.to_path_buf();
             let thread = std::thread::spawn(move || {
-                let _priority = InvocationPriorityScope::enter(Some(priority));
+                let _priority = InvocationPriorityScope::enter_client(Some(client));
                 let scheduler = test_scheduler(&cache, pool);
                 pressure::force(Some(level));
                 let Some(permit) = scheduler.acquire_permit(weight) else {
@@ -5142,6 +5165,59 @@ mod tests {
         background.finish();
         later_background.admitted(Duration::from_secs(5));
         later_background.finish();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_held_build_yields_its_place_until_it_is_continued() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        // The client of the earlier request; stopping it holds that build.
+        let mut client = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let client_pid = client.id();
+        let signal = |signal| unsafe { libc::kill(client_pid as libc::pid_t, signal) };
+        let rank_of = |id: &str| {
+            queued(cache)
+                .into_iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.rank)
+        };
+        let holder = Requester::running(cache, 1, 1, Priority::Background);
+        let earlier = Requester::spawn_for(
+            cache,
+            1,
+            1,
+            Client {
+                priority: Priority::Background,
+                pid: Some(client_pid),
+            },
+            Level::Calm,
+        );
+        wait_until("the earlier request to queue", || queued(cache).len() == 1);
+        let earlier_id = queued(cache)[0].id.clone();
+        let arrived = rank_of(&earlier_id).unwrap();
+        let later = Requester::queued(cache, 1, 1, Priority::Background, 2);
+
+        signal(libc::SIGSTOP);
+        wait_until("the held build to rank behind", || {
+            rank_of(&earlier_id) == Some(arrived + queue::HELD_BEHIND)
+        });
+        holder.finish();
+        later.admitted(Duration::from_secs(5));
+        assert!(earlier.still_waiting(), "a held build waits");
+
+        signal(libc::SIGCONT);
+        wait_until("the continued build to rank by arrival", || {
+            rank_of(&earlier_id) == Some(arrived)
+        });
+        later.finish();
+        earlier.admitted(Duration::from_secs(5));
+        earlier.finish();
+        let _ = client.kill();
+        let _ = client.wait();
     }
 
     #[test]

@@ -419,7 +419,7 @@ pub(super) async fn handle(
     );
     // Read while the connection still names the client, so a reused PID
     // cannot stand in for it. Its compiler children inherit the same.
-    context.priority = Some(crate::scheduler::Priority::of_process(client_pid));
+    context.priority = Some(crate::scheduler::Client::of_process(client_pid));
     write_reply(stream, &ExecutionReply::Accepted).await?;
     let activity = daemon.request_clock.begin_activity();
 
