@@ -17,6 +17,7 @@ use std::ffi::OsStr;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// The directories a command may read or write build output in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,14 +198,30 @@ fn still_named(_: &File, _: &Path) -> bool {
     true
 }
 
+/// How often a bounded wait tries a lock that cleanup holds again.
+const BOUNDED_POLL: Duration = Duration::from_millis(100);
+
+/// How long a wait for cleanup may last: forever, or until a deadline.
+#[derive(Debug, Clone, Copy)]
+enum Wait {
+    Forever,
+    /// Give up at `deadline`; `budget` is what the notice reports.
+    Until {
+        deadline: Instant,
+        budget: Duration,
+    },
+}
+
 /// Share the lock at `path`, waiting for a cleanup that holds it. `said`
-/// keeps the notice to one line per lease.
+/// keeps the notice to one line per lease. `None` when a bounded wait ran
+/// out first.
 fn lock_shared(
     path: &Path,
     cache_dir: &Path,
     notice: &mut dyn Write,
     said: &mut bool,
-) -> io::Result<File> {
+    wait: Wait,
+) -> io::Result<Option<File>> {
     loop {
         let file = open_lock(path)?;
         match file.try_lock_shared() {
@@ -212,16 +229,44 @@ fn lock_shared(
             // One write, so the line stays whole beside other processes' output.
             Err(TryLockError::WouldBlock) => {
                 if !std::mem::replace(said, true) {
-                    let _ = notice.write_all(waiting(cache_dir).as_bytes());
+                    let line = match wait {
+                        Wait::Forever => waiting(cache_dir),
+                        Wait::Until { budget, .. } => waiting_at_most(cache_dir, path, budget),
+                    };
+                    let _ = notice.write_all(line.as_bytes());
                 }
-                file.lock_shared()?;
+                match wait {
+                    Wait::Forever => file.lock_shared()?,
+                    Wait::Until { deadline, .. } => {
+                        if !lock_shared_by(&file, deadline)? {
+                            return Ok(None);
+                        }
+                    }
+                }
             }
             Err(TryLockError::Error(error)) => return Err(error),
         }
         if still_named(&file, path) {
-            return Ok(file);
+            return Ok(Some(file));
         }
         let _ = file.unlock();
+    }
+}
+
+/// Retry a shared lock on `file` until `deadline`: whether it was taken.
+/// The platform's blocking lock has no timeout, so this polls.
+fn lock_shared_by(file: &File, deadline: Instant) -> io::Result<bool> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(BOUNDED_POLL.min(deadline - now));
+        match file.try_lock_shared() {
+            Ok(()) => return Ok(true),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(error)) => return Err(error),
+        }
     }
 }
 
@@ -371,15 +416,45 @@ pub(crate) fn shared_in(
     what: &str,
     notice: &mut dyn Write,
 ) -> io::Result<Lease> {
+    let lease = lease_in(cache_dir, scope, what, notice, Wait::Forever)?;
+    Ok(lease.expect("an unbounded wait always ends with the lease"))
+}
+
+/// [`shared_in`] that waits for cleanup at most `budget`: `None` when the
+/// budget ran out, holding nothing. The notice names the lock waited on,
+/// the cleanup process when it left a record, and the budget.
+pub(crate) fn shared_within(
+    cache_dir: &Path,
+    scope: &Scope,
+    what: &str,
+    notice: &mut dyn Write,
+    budget: Duration,
+) -> io::Result<Option<Lease>> {
+    let wait = Wait::Until {
+        deadline: Instant::now() + budget,
+        budget,
+    };
+    lease_in(cache_dir, scope, what, notice, wait)
+}
+
+fn lease_in(
+    cache_dir: &Path,
+    scope: &Scope,
+    what: &str,
+    notice: &mut dyn Write,
+    wait: Wait,
+) -> io::Result<Option<Lease>> {
     let mut lease = Lease::default();
     let mut said = false;
     for lock in lease_locks(cache_dir, scope) {
-        lease
-            .files
-            .push(lock_shared(&lock, cache_dir, notice, &mut said)?);
+        match lock_shared(&lock, cache_dir, notice, &mut said, wait)? {
+            Some(file) => lease.files.push(file),
+            // Dropping the partial lease unlocks what it took.
+            None => return Ok(None),
+        }
     }
     lease.record = record_holder(cache_dir, scope, what);
-    Ok(lease)
+    Ok(Some(lease))
 }
 
 /// [`shared_in`] for a command started with `args`. The line goes to stderr
@@ -404,13 +479,30 @@ fn quiet<'a>(args: impl IntoIterator<Item = &'a OsStr>) -> bool {
         .any(|arg| arg == "-q" || arg == "--quiet")
 }
 
+/// The process of the cleanup holding a reservation, when it left a record.
+fn cleanup_pid(cache_dir: &Path) -> Option<u32> {
+    std::fs::read_to_string(holder_record(cache_dir))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+}
+
+/// What a bounded wait says: the lock, the cleanup holding it when it left
+/// a record, and how long the wait may last.
+fn waiting_at_most(cache_dir: &Path, lock: &Path, budget: Duration) -> String {
+    let holder = match cleanup_pid(cache_dir) {
+        Some(pid) => format!("target cleanup (pid {pid})"),
+        None => "target cleanup".to_owned(),
+    };
+    format!(
+        "kache: waiting up to {budget:?} for {holder} to release {}\n",
+        lock.display()
+    )
+}
+
 /// What a command waiting for cleanup says, with the cleanup's process when
 /// it left a record.
 fn waiting(cache_dir: &Path) -> String {
-    let pid = std::fs::read_to_string(holder_record(cache_dir))
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok());
-    match pid {
+    match cleanup_pid(cache_dir) {
         Some(pid) => format!("kache: waiting for target cleanup (pid {pid}) to finish\n"),
         None => "kache: waiting for target cleanup to finish\n".to_owned(),
     }
@@ -478,7 +570,6 @@ pub(crate) fn prune_locks(_: &Path) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     /// Hands each write to the test as it happens.
     struct Said(std::sync::mpsc::Sender<Vec<u8>>);
@@ -828,6 +919,65 @@ mod tests {
     }
 
     #[test]
+    fn a_bounded_wait_names_the_lock_and_cleanup_then_gives_up_holding_nothing() {
+        let fx = Fixture::new();
+        let cleanup = try_exclusive(&fx.cache, &fx.at("ws/target"))
+            .unwrap()
+            .unwrap();
+        let mut said = Vec::new();
+        let started = Instant::now();
+        let lease = shared_within(
+            &fx.cache,
+            &fx.within(&["ws/target/debug/deps"]),
+            "tests",
+            &mut said,
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        assert!(lease.is_none(), "took the lease while cleanup held it");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        let said = String::from_utf8(said).unwrap();
+        let expected = format!(
+            "kache: waiting up to 300ms for target cleanup (pid {}) to release {}\n",
+            std::process::id(),
+            locks_dir(&fx.cache).display()
+        );
+        assert!(said.starts_with(&expected[..expected.len() - 1]), "{said}");
+        assert_eq!(said.lines().count(), 1, "{said}");
+        assert!(holders(&fx.cache).is_empty(), "a record outlived the wait");
+        drop(cleanup);
+        // Nothing the wait took is still held.
+        assert!(fx.free("ws/target"));
+    }
+
+    #[test]
+    fn a_bounded_wait_takes_the_lease_once_cleanup_ends_in_time() {
+        let fx = Fixture::new();
+        let cleanup = try_exclusive(&fx.cache, &fx.at("ws/target"))
+            .unwrap()
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(cleanup);
+        });
+        let mut said = Vec::new();
+        let lease = shared_within(
+            &fx.cache,
+            &fx.within(&["ws"]),
+            "tests",
+            &mut said,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .expect("the wait gave up although cleanup ended");
+        release.join().unwrap();
+        assert_eq!(String::from_utf8(said).unwrap().lines().count(), 1);
+        assert!(!fx.free("ws/target"), "the lease does not keep its target");
+        drop(lease);
+        assert!(fx.free("ws/target"));
+    }
+
+    #[test]
     fn a_command_takes_a_free_lock_without_a_word() {
         let dir = tempfile::tempdir().unwrap();
         let mut said = Vec::new();
@@ -912,8 +1062,13 @@ mod tests {
         assert!(!still_named(&stale, &lock));
         assert!(still_named(&fresh, &lock));
         let mut said = false;
-        let taken = lock_shared(&lock, &fx.cache, &mut io::sink(), &mut said).unwrap();
+        let taken = lock_shared(&lock, &fx.cache, &mut io::sink(), &mut said, Wait::Forever)
+            .unwrap()
+            .unwrap();
         assert!(still_named(&taken, &lock));
+        // Unlock, not only close: a test forking beside this one can hold
+        // the descriptor for an instant (see `Lease`).
+        taken.unlock().unwrap();
         drop(taken);
         let taken = try_lock_exclusive(&lock).unwrap().unwrap();
         assert!(still_named(&taken, &lock));
