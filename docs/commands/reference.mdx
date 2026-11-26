@@ -61,7 +61,7 @@ Pass Cargo arguments after `--`. Kache runs Cargo and holds the lock that keeps 
 
 Other commands, such as `test`, run without these changes.
 
-If `kache clean` or the daemon's target cleanup holds that lock when Cargo starts, Kache prints `kache: waiting for target cleanup (pid 4242) to finish` on stderr and starts Cargo once the cleanup releases the lock. Cargo's `-q` or `--quiet` hides the line. A test run through `kache test-runner` waits the same way.
+If `kache clean` or the daemon's target cleanup holds that lock when Cargo starts, Kache prints `kache: waiting for target cleanup (pid 4242) to finish` on stderr and starts Cargo once the cleanup releases the lock. Cargo's `-q` or `--quiet` hides the line. A test run through `kache test-runner` waits at most 120 seconds and always prints a line, even under `--quiet`: `kache: waiting up to 120s for target cleanup (pid 4242) to release <lock file>`. Past that it prints `kache test-runner: gave up waiting 120s for target cleanup; running <test> without the target lease` and runs the test.
 
 ## `kache list`
 

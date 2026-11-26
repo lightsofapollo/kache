@@ -35,6 +35,10 @@ pub(crate) use delegate::runner_var;
 /// `slow-timeout` and `terminate-after`.
 const NEXTEST_WAIT: Duration = Duration::from_secs(120);
 
+/// How long a test binary waits for target cleanup before it runs without
+/// a target lease (see [`protect_target`]).
+const TARGET_USE_WAIT: Duration = Duration::from_secs(120);
+
 /// Exit code when the test binary cannot be run: the code a failed test run
 /// gives Cargo.
 const RUN_FAILED: i32 = 101;
@@ -131,23 +135,15 @@ pub fn run(args: &[OsString]) -> i32 {
     let env = TestEnv::capture();
     let config = crate::config::Config::load().ok();
     let cache_dir = config.as_ref().map(|config| config.cache_dir.as_path());
-    let test_args = args[1..].iter().map(OsString::as_os_str);
-    let target_use = match cache_dir
-        .map(|dir| {
-            crate::target_use::shared_for(
-                dir,
-                &binary_scope(&args[0]),
-                &binary_label(&args[0]),
-                test_args,
-            )
-        })
-        .transpose()
-    {
-        Ok(lease) => lease,
-        Err(error) => {
-            eprintln!("kache test-runner: cannot protect target directory: {error}");
-            return RUN_FAILED;
-        }
+    let target_use = match cache_dir {
+        None => None,
+        Some(dir) => match protect_target(dir, &args[0], &mut std::io::stderr()) {
+            Ok(lease) => lease,
+            Err(error) => {
+                eprintln!("kache test-runner: cannot protect target directory: {error}");
+                return RUN_FAILED;
+            }
+        },
     };
     let scheduler_dir = config
         .as_ref()
@@ -172,6 +168,40 @@ pub fn run(args: &[OsString]) -> i32 {
             None => exec(&command, marker),
         },
     }
+}
+
+/// Lease the binary's directory against target cleanup, waiting at most
+/// [`TARGET_USE_WAIT`]. Past that the binary runs without the lease: a test
+/// stalled silently behind a cleanup costs more than the small chance that
+/// the cleanup removes the binary's own directory. Both the wait and the
+/// fallback say so on `notice`, even under `--quiet`, since nothing else
+/// shows the stall.
+fn protect_target(
+    cache_dir: &Path,
+    binary: &OsStr,
+    notice: &mut dyn std::io::Write,
+) -> std::io::Result<Option<crate::target_use::Lease>> {
+    protect_target_within(cache_dir, binary, notice, TARGET_USE_WAIT)
+}
+
+fn protect_target_within(
+    cache_dir: &Path,
+    binary: &OsStr,
+    notice: &mut dyn std::io::Write,
+    budget: Duration,
+) -> std::io::Result<Option<crate::target_use::Lease>> {
+    let label = binary_label(binary);
+    let lease =
+        crate::target_use::shared_within(cache_dir, &binary_scope(binary), &label, notice, budget)?;
+    if lease.is_none() {
+        let _ = notice.write_all(
+            format!(
+                "kache test-runner: gave up waiting {budget:?} for target cleanup; running {label} without the target lease\n"
+            )
+            .as_bytes(),
+        );
+    }
+    Ok(lease)
 }
 
 /// Keep the target lease in this process until an unscheduled test exits.
@@ -820,5 +850,52 @@ mod tests {
     fn finish_returns_the_exit_code() {
         assert_eq!(finish(Disposition::Exit(7)), 7);
         assert_eq!(finish(Disposition::Exit(0)), 0);
+    }
+
+    #[test]
+    fn a_test_behind_target_cleanup_says_so_and_runs_without_the_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let deps = dir.path().join("ws/target/debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let binary = deps.join("tests-0123456789abcdef");
+        let cleanup = crate::target_use::try_exclusive(&cache, &dir.path().join("ws/target"))
+            .unwrap()
+            .unwrap();
+        let mut said = Vec::new();
+        let lease = protect_target_within(
+            &cache,
+            binary.as_os_str(),
+            &mut said,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(lease.is_none());
+        let said = String::from_utf8(said).unwrap();
+        let lines: Vec<&str> = said.lines().collect();
+        assert_eq!(lines.len(), 2, "{said}");
+        assert!(
+            lines[0].starts_with(&format!(
+                "kache: waiting up to 200ms for target cleanup (pid {})",
+                std::process::id()
+            )),
+            "{said}"
+        );
+        assert_eq!(
+            lines[1],
+            "kache test-runner: gave up waiting 200ms for target cleanup; running tests without the target lease"
+        );
+        drop(cleanup);
+
+        let mut said = Vec::new();
+        let lease = protect_target_within(
+            &cache,
+            binary.as_os_str(),
+            &mut said,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(lease.is_some(), "a free directory was not leased");
+        assert!(said.is_empty(), "{}", String::from_utf8_lossy(&said));
     }
 }

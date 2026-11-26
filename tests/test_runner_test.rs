@@ -354,8 +354,9 @@ fn an_unscheduled_test_holds_target_protection_until_exit() {
 }
 
 #[test]
-fn a_test_waiting_for_target_cleanup_says_so_unless_cargo_is_quiet() {
-    const WAITING: &str = "kache: waiting for target cleanup to finish\n";
+fn a_test_waiting_for_target_cleanup_says_so_even_when_cargo_is_quiet() {
+    // A silent wait looked like a hung test, so the line shows under `-q` too.
+    const WAITING: &str = "kache: waiting up to 120s for target cleanup to release ";
     for quiet in [false, true] {
         let fixture = Fixture::new();
         fs::create_dir_all(fixture.cache()).unwrap();
@@ -387,18 +388,17 @@ fn a_test_waiting_for_target_cleanup_says_so_unless_cargo_is_quiet() {
             }
         }
         let mut child = command.spawn().unwrap();
-        if quiet {
-            std::thread::sleep(Duration::from_millis(500));
-        } else {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while !fs::read_to_string(&stderr).unwrap().contains(WAITING) {
-                assert!(
-                    child.try_wait().unwrap().is_none(),
-                    "the runner exited without waiting"
-                );
-                assert!(Instant::now() < deadline, "the runner never said it waits");
-                std::thread::sleep(Duration::from_millis(10));
-            }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !fs::read_to_string(&stderr).unwrap().contains(WAITING) {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "quiet={quiet}: the runner exited without waiting"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "quiet={quiet}: the runner never said it waits"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
             !started.exists(),
@@ -409,7 +409,7 @@ fn a_test_waiting_for_target_cleanup_says_so_unless_cargo_is_quiet() {
         assert!(child.wait().unwrap().success(), "quiet={quiet}");
         assert!(started.exists(), "quiet={quiet}: the test never started");
         let said = fs::read_to_string(&stderr).unwrap();
-        assert_eq!(said.matches(WAITING).count(), usize::from(!quiet), "{said}");
+        assert_eq!(said.matches(WAITING).count(), 1, "{said}");
     }
 }
 
