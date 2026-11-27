@@ -21,6 +21,7 @@ mod config_tui;
 mod daemon;
 mod daemon_publish;
 mod demand;
+mod disk_floor;
 mod disk_recovery;
 mod events;
 mod explain;

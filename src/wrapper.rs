@@ -1223,6 +1223,7 @@ fn admit_scheduler_miss_with<T>(
     is_link: bool,
     mut recheck: impl FnMut() -> Option<T>,
 ) -> (MissGuard, Option<T>) {
+    crate::disk_floor::hold_new_job(config);
     if !config.scheduler {
         return (MissGuard::empty(), None);
     }
@@ -1244,6 +1245,19 @@ fn admit_scheduler_miss_with<T>(
             scheduler::BeginMiss::Compile(guard) => return (guard, None),
         }
     }
+}
+
+/// [`scheduler::begin_keyless_compile`] for `config`, once its volume is
+/// over the job floor ([`crate::disk_floor`]).
+fn begin_keyless_compile(config: &Config, crate_name: &str, is_link: bool) -> MissGuard {
+    crate::disk_floor::hold_new_job(config);
+    scheduler::begin_keyless_compile(
+        &config.cache_dir,
+        config.scheduler,
+        crate_name,
+        is_link,
+        config.test_lease.as_deref(),
+    )
 }
 
 /// [`BuildClaim`] for a Rust key, whose entry may be under the shared key or
@@ -6712,13 +6726,7 @@ fn adaptive_compile_before_key(
     mut key_hash_stats: FileHashStats,
 ) -> Result<i32> {
     crate::out_dir_alias::register_before_compile();
-    let permit = scheduler::begin_keyless_compile(
-        &ctx.config.cache_dir,
-        ctx.config.scheduler,
-        ctx.crate_name,
-        ctx.args.invokes_linker(),
-        ctx.config.test_lease.as_deref(),
-    );
+    let permit = begin_keyless_compile(ctx.config, ctx.crate_name, ctx.args.invokes_linker());
     let (mut compiler_args, seed_attempt) =
         prepare_worktree_compiler_args(ctx.config, ctx.args, &mut lease);
     let bootstrap = std::cell::Cell::new(lease.worktree_bootstrap());
@@ -6932,13 +6940,7 @@ fn compile_before_key(
     crate::out_dir_alias::register_before_compile();
     // No key yet, but the compile still takes a slot in the scheduler's
     // pool, as every other compile does.
-    let miss_guard = scheduler::begin_keyless_compile(
-        &config.cache_dir,
-        config.scheduler,
-        crate_name,
-        args.invokes_linker(),
-        config.test_lease.as_deref(),
-    );
+    let miss_guard = begin_keyless_compile(config, crate_name, args.invokes_linker());
     let compile_start = std::time::Instant::now();
     // An entry could exist: key from the dep-info rustc writes right
     // after expansion, and stop the compile if that key is stored. This
@@ -8839,15 +8841,8 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     let kind = lease.kind();
     let (mut compiler_args, seed_attempt) =
         prepare_worktree_compiler_args(config, args, &mut lease);
-    let permit = adaptive_lane_takes_permit(kind).then(|| {
-        scheduler::begin_keyless_compile(
-            &config.cache_dir,
-            config.scheduler,
-            crate_name,
-            args.invokes_linker(),
-            config.test_lease.as_deref(),
-        )
-    });
+    let permit = adaptive_lane_takes_permit(kind)
+        .then(|| begin_keyless_compile(config, crate_name, args.invokes_linker()));
     let compile_start = std::time::Instant::now();
     let mut compiler = RustcCompiler::new_for(args.invocation_env())
         .with_base_dirs(config.base_dirs.clone())
@@ -9124,15 +9119,8 @@ fn passthrough_with_event<R: Into<String>>(
         return Ok(exit_code);
     }
     let reason = reason.into();
-    let permit = (reason == "native runtime warmup").then(|| {
-        scheduler::begin_keyless_compile(
-            &config.cache_dir,
-            config.scheduler,
-            crate_name,
-            args.invokes_linker(),
-            config.test_lease.as_deref(),
-        )
-    });
+    let permit = (reason == "native runtime warmup")
+        .then(|| begin_keyless_compile(config, crate_name, args.invokes_linker()));
     let output = passthrough(
         args,
         config.fallback.as_deref(),
@@ -9238,13 +9226,7 @@ fn cc_compile_before_key(
     // The compile runs before its key exists, but it still takes a slot in the
     // scheduler's pool: that pool is the only limit when a build runs its own
     // jobs beside Cargo's.
-    let miss_guard = scheduler::begin_keyless_compile(
-        &config.cache_dir,
-        config.scheduler,
-        crate_name,
-        false,
-        config.test_lease.as_deref(),
-    );
+    let miss_guard = begin_keyless_compile(config, crate_name, false);
     let compile_start = std::time::Instant::now();
     let compiled = compiler.execute_capturing_inputs(parsed, file_hasher);
     miss_guard.record_compile_rss(crate_name);
