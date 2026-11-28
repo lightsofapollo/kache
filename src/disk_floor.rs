@@ -67,6 +67,7 @@ pub(crate) fn hold_new_job(config: &Config) -> Hold {
     let (poll, max_wait) = timing();
     hold_with(
         job_floor(recovery_floor),
+        polls(poll, max_wait),
         max_wait,
         || kache_fs::volume_usage(&config.cache_dir),
         || wait_step(config, poll),
@@ -80,8 +81,15 @@ fn wait_step(config: &Config, poll: Duration) {
     std::thread::sleep(poll);
 }
 
+/// How many polls of `poll` fill `max_wait`, at least one. A count, not a
+/// clock, bounds the wait, so no reading of the time can make it endless.
+fn polls(poll: Duration, max_wait: Duration) -> u128 {
+    (max_wait.as_millis() / poll.as_millis().max(1)).max(1)
+}
+
 fn hold_with(
     floor: u64,
+    polls: u128,
     max_wait: Duration,
     mut usage: impl FnMut() -> Option<VolumeUsage>,
     mut wait: impl FnMut(),
@@ -101,20 +109,18 @@ fn hold_with(
     ));
     tracing::warn!(free, floor, "compile held under the disk floor");
     let started = Instant::now();
-    loop {
+    for _ in 0..polls {
         wait();
         if !under(floor, usage()) {
             return Hold::Freed(started.elapsed());
         }
-        if started.elapsed() >= max_wait {
-            say(&format!(
-                "kache: the cache volume is still under the {} floor after {}m; compiling anyway",
-                crate::term::bytes(floor),
-                max_wait.as_secs() / 60,
-            ));
-            return Hold::GaveUp;
-        }
     }
+    say(&format!(
+        "kache: the cache volume is still under the {} floor after {}m; compiling anyway",
+        crate::term::bytes(floor),
+        max_wait.as_secs() / 60,
+    ));
+    Hold::GaveUp
 }
 
 #[cfg(test)]
@@ -150,6 +156,7 @@ mod tests {
         let mut said = Vec::new();
         let hold = hold_with(
             100,
+            600,
             MAX_WAIT,
             || at(500),
             || waits += 1,
@@ -167,6 +174,7 @@ mod tests {
         let mut said = Vec::new();
         let hold = hold_with(
             100,
+            600,
             MAX_WAIT,
             || at(free.next().unwrap()),
             || waits += 1,
@@ -185,16 +193,15 @@ mod tests {
         let mut said = Vec::new();
         let hold = hold_with(
             100,
-            Duration::from_millis(30),
+            3,
+            MAX_WAIT,
             || at(10),
-            || {
-                waits += 1;
-                std::thread::sleep(Duration::from_millis(10));
-            },
+            || waits += 1,
             |line| said.push(line.to_owned()),
         );
         assert_eq!(hold, Hold::GaveUp);
-        assert!(waits >= 1, "waited {waits} times");
+        assert_eq!(waits, 3);
+        assert!(said[1].contains("after 20m"), "{said:?}");
         assert_eq!(said.len(), 2);
         assert!(said[1].contains("compiling anyway"), "{said:?}");
     }
@@ -214,6 +221,17 @@ mod tests {
         assert_eq!(hold_new_job(&config), Hold::GaveUp);
         assert_eq!(POLL, Duration::from_secs(2));
         assert_eq!(MAX_WAIT, Duration::from_secs(1200));
+    }
+
+    #[test]
+    fn the_wait_is_a_count_of_polls() {
+        assert_eq!(polls(POLL, MAX_WAIT), 600);
+        assert_eq!(
+            polls(Duration::from_millis(3), Duration::from_millis(10)),
+            3
+        );
+        assert_eq!(polls(Duration::from_millis(1), Duration::ZERO), 1);
+        assert_eq!(polls(Duration::ZERO, Duration::from_millis(5)), 5);
     }
 
     #[test]
