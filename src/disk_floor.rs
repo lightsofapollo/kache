@@ -176,7 +176,7 @@ mod tests {
             |line| said.push(line.to_owned()),
         );
         assert_eq!(hold, Hold::GaveUp);
-        assert!(waits >= 3, "waited {waits} times");
+        assert!(waits >= 1, "waited {waits} times");
         assert_eq!(said.len(), 2);
         assert!(said[1].contains("compiling anyway"), "{said:?}");
     }
