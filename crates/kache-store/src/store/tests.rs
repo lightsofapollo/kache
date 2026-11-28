@@ -16957,4 +16957,9 @@ fn an_automatic_sweep_stops_at_its_budget() {
     let unbounded = store.evict_within(SweepOrigin::Automatic, None).unwrap();
     assert!(unbounded.entries_evicted >= 1, "{unbounded:?}");
     assert_eq!(AUTOMATIC_SWEEP_BUDGET, Duration::from_secs(600));
+    assert_eq!(
+        sweep_budget(SweepOrigin::Automatic),
+        Some(Duration::from_secs(600))
+    );
+    assert_eq!(sweep_budget(SweepOrigin::Requested), None);
 }

@@ -18,6 +18,23 @@ use std::time::{Duration, Instant};
 const POLL: Duration = Duration::from_secs(2);
 const MAX_WAIT: Duration = Duration::from_secs(20 * 60);
 
+#[cfg(test)]
+thread_local! {
+    /// The poll and longest wait of a hold on this thread. Other tests compile
+    /// on volumes they fake as full, so a test hold gives up at once unless
+    /// its test asks for longer.
+    static TEST_TIMING: std::cell::Cell<(Duration, Duration)> =
+        const { std::cell::Cell::new((Duration::from_millis(1), Duration::ZERO)) };
+}
+
+/// The poll and longest wait of a hold.
+fn timing() -> (Duration, Duration) {
+    #[cfg(test)]
+    return TEST_TIMING.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    (POLL, MAX_WAIT)
+}
+
 /// The free bytes under which a new compile waits, for a recovery floor.
 pub(crate) fn job_floor(recovery_floor: u64) -> u64 {
     recovery_floor - recovery_floor / 4
@@ -47,11 +64,12 @@ pub(crate) fn hold_new_job(config: &Config) -> Hold {
     } else {
         0
     };
+    let (poll, max_wait) = timing();
     hold_with(
         job_floor(recovery_floor),
-        MAX_WAIT,
+        max_wait,
         || kache_fs::volume_usage(&config.cache_dir),
-        || wait_step(config, POLL),
+        || wait_step(config, poll),
         crate::notice::show,
     )
 }
@@ -182,6 +200,23 @@ mod tests {
     }
 
     #[test]
+    fn a_held_test_compile_gives_up_at_once_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::test_support::test_config(dir.path().join("cache"));
+        config.auto_recover_min_free_bytes = 400;
+        let _volume = kache_fs::testutil::VolumeUsageGuard::new(
+            &config.cache_dir,
+            Some(VolumeUsage {
+                total: 1000,
+                free: 0,
+            }),
+        );
+        assert_eq!(hold_new_job(&config), Hold::GaveUp);
+        assert_eq!(POLL, Duration::from_secs(2));
+        assert_eq!(MAX_WAIT, Duration::from_secs(1200));
+    }
+
+    #[test]
     fn a_disabled_recovery_floor_never_holds() {
         let dir = tempfile::tempdir().unwrap();
         let config = crate::test_support::test_config(dir.path().join("cache"));
@@ -213,10 +248,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
             drop(volume);
         });
+        let poll = Duration::from_millis(20);
+        TEST_TIMING.with(|timing| timing.set((poll, Duration::from_secs(60))));
         let hold = hold_new_job(&config);
         freer.join().unwrap();
         assert!(
-            matches!(hold, Hold::Freed(waited) if waited >= POLL),
+            matches!(hold, Hold::Freed(waited) if waited >= poll),
             "{hold:?}"
         );
     }

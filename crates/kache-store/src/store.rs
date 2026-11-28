@@ -1475,6 +1475,11 @@ pub const HIT_STAMP_INTERVAL: Duration = Duration::from_secs(30);
 /// sweep measures again.
 pub const AUTOMATIC_SWEEP_BUDGET: Duration = Duration::from_secs(10 * 60);
 
+/// How long a size sweep started by `origin` may run.
+fn sweep_budget(origin: SweepOrigin) -> Option<Duration> {
+    (origin == SweepOrigin::Automatic).then_some(AUTOMATIC_SWEEP_BUDGET)
+}
+
 /// Write-lock time an eviction sweep may spend on removals before it pauses.
 ///
 /// SQLite's write lock is not fair. A build's `put` that finds it taken
@@ -6077,8 +6082,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// [`Self::evict`] for a sweep started by `origin`. An automatic sweep
     /// stops after [`AUTOMATIC_SWEEP_BUDGET`] and gives `gc.lock` back.
     pub fn evict_for(&self, origin: SweepOrigin) -> Result<GcStats> {
-        let budget = (origin == SweepOrigin::Automatic).then_some(AUTOMATIC_SWEEP_BUDGET);
-        self.evict_within(origin, budget)
+        self.evict_within(origin, sweep_budget(origin))
     }
 
     /// [`Self::evict_for`], stopping once `budget` has passed.
