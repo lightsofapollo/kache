@@ -16936,3 +16936,30 @@ fn index_open_probe_lock_child_fixture() {
     };
     std::fs::write(root.join("lock-result"), result).unwrap();
 }
+
+/// An automatic sweep stops at its budget and gives `gc.lock` back, so the
+/// next sweep measures the store again; a requested one has no budget.
+#[test]
+fn an_automatic_sweep_stops_at_its_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 1000;
+    let store = Store::open(&config).unwrap();
+    put_idle_entry(&store, dir.path(), "a", 600);
+    put_idle_entry(&store, dir.path(), "b", 600);
+
+    let spent = store
+        .evict_within(SweepOrigin::Automatic, Some(Duration::ZERO))
+        .unwrap();
+    assert_eq!(spent.entries_evicted, 0, "{spent:?}");
+    assert!(store.contains("a") && store.contains("b"));
+
+    let unbounded = store.evict_within(SweepOrigin::Automatic, None).unwrap();
+    assert!(unbounded.entries_evicted >= 1, "{unbounded:?}");
+    assert_eq!(AUTOMATIC_SWEEP_BUDGET, Duration::from_secs(600));
+    assert_eq!(
+        sweep_budget(SweepOrigin::Automatic),
+        Some(Duration::from_secs(600))
+    );
+    assert_eq!(sweep_budget(SweepOrigin::Requested), None);
+}

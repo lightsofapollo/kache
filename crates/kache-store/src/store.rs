@@ -1468,6 +1468,18 @@ impl SweepOrigin {
 /// the index's write lock.
 pub const HIT_STAMP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Longest an automatic size sweep runs before it gives `gc.lock` back.
+/// Under ten parallel builds a sweep paced behind index contention ran for
+/// hours: its size snapshot went stale while the store grew past a terabyte,
+/// and free-space recovery, which needs the same lock, never ran. The next
+/// sweep measures again.
+pub const AUTOMATIC_SWEEP_BUDGET: Duration = Duration::from_secs(10 * 60);
+
+/// How long a size sweep started by `origin` may run.
+fn sweep_budget(origin: SweepOrigin) -> Option<Duration> {
+    (origin == SweepOrigin::Automatic).then_some(AUTOMATIC_SWEEP_BUDGET)
+}
+
 /// Write-lock time an eviction sweep may spend on removals before it pauses.
 ///
 /// SQLite's write lock is not fair. A build's `put` that finds it taken
@@ -6067,9 +6079,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.evict_for(SweepOrigin::Requested)
     }
 
-    /// [`Self::evict`] for a sweep started by `origin`.
+    /// [`Self::evict`] for a sweep started by `origin`. An automatic sweep
+    /// stops after [`AUTOMATIC_SWEEP_BUDGET`] and gives `gc.lock` back.
     pub fn evict_for(&self, origin: SweepOrigin) -> Result<GcStats> {
+        self.evict_within(origin, sweep_budget(origin))
+    }
+
+    /// [`Self::evict_for`], stopping once `budget` has passed.
+    fn evict_within(&self, origin: SweepOrigin, budget: Option<Duration>) -> Result<GcStats> {
         self.refuse_write("evict")?;
+        let started = std::time::Instant::now();
         let target = crate::eviction::eviction_target(self.config.max_size);
         // Trigger, budget, and stop condition are all physical bytes on disk
         // (`SUM(blobs.size)`), not the logical `SUM(entries.size)`: on a
@@ -6097,7 +6116,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             (origin == SweepOrigin::Automatic).then_some(self.config.max_size),
             true,
             origin,
-            &mut || false,
+            &mut || budget.is_some_and(|budget| started.elapsed() >= budget),
         )
     }
 
